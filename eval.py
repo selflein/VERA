@@ -31,6 +31,7 @@ from tqdm import tqdm
 import models.wideresnet as wideresnet
 import utils
 from models.get_models import get_models
+from utils.calibration import classification_calibration
 
 # Sampling
 torch.backends.cudnn.benchmark = True
@@ -39,6 +40,10 @@ seed = 1
 im_sz = 32
 n_ch = 3
 n_classes = 10
+
+
+def to_np(tensor):
+    return tensor.detach().cpu().numpy()
 
 
 class DataSubset(Dataset):
@@ -293,27 +298,42 @@ def OODAUC(f, args, device):
          lambda x: x + args.sigma * torch.randn_like(x)]
     )
 
-    dset_real = tv.datasets.CIFAR10(root="../data", transform=transform_test, download=True, train=False)
-    dload_real = DataLoader(dset_real, batch_size=100, shuffle=False, num_workers=4, drop_last=False)
+    transform_test_resize = tr.Compose([
+        tr.Resize(32),
+        tr.CenterCrop(32),
+        tr.ToTensor(),
+        tr.Normalize((.5, .5, .5), (.5, .5, .5)),
+        lambda x: x + args.sigma * torch.randn_like(x)
+    ])
+
+    dset_real = tv.datasets.CIFAR10(root="../data", transform=transform_test,
+                                    download=True, train=False)
+    dload_real = DataLoader(dset_real, batch_size=100, shuffle=False,
+                            num_workers=4, drop_last=False)
 
     if args.ood_dataset == "svhn":
-        dset_fake = tv.datasets.SVHN(root="../data", transform=transform_test, download=True, split="test")
+        dset_fake = tv.datasets.SVHN(root="../data", transform=transform_test,
+                                     download=True, split="test")
+    elif args.ood_dataset == "lsun":
+        dset_fake = tv.datasets.LSUN(root="../data/lsun",
+                                     transform=transform_test_resize,
+                                     classes="test")
     elif args.ood_dataset == "cifar_100":
-        dset_fake = tv.datasets.CIFAR100(root="../data", transform=transform_test, download=True, train=False)
+        dset_fake = tv.datasets.CIFAR100(root="../data",
+                                         transform=transform_test,
+                                         download=True, train=False)
     elif args.ood_dataset == "celeba":
-        dset_fake = tv.datasets.CelebA(root="./data", split="test",
-                                       transform=tr.Compose([tr.Resize(32),
-                                                             tr.ToTensor(),
-                                                             tr.Normalize((.5, .5, .5), (.5, .5, .5)),
-                                                             lambda x: x + args.sigma * torch.randn_like(x)]),
-                                       download=False)
+        dset_fake = tv.datasets.ImageFolder(
+            root="/scratch/gobi1/gwohl/CelebA/splits",
+            transform=transform_test_resize)
     else:
-        dset_fake = tv.datasets.CIFAR10(root="../data", transform=transform_test, download=True, train=False)
+        dset_fake = tv.datasets.CIFAR10(root="../data",
+                                        transform=transform_test, download=True,
+                                        train=False)
 
-    dload_fake = DataLoader(dset_fake, batch_size=100, shuffle=True, num_workers=4, drop_last=False)
+    dload_fake = DataLoader(dset_fake, batch_size=100, shuffle=True,
+                            num_workers=4, drop_last=False)
     print(len(dload_real), len(dload_fake))
-    real_scores = []
-    print("Real scores...")
 
     def score_fn(x):
         if args.score_fn == "px":
@@ -323,11 +343,21 @@ def OODAUC(f, args, device):
         else:
             return -grad_norm(x).detach().cpu()
 
-    for x, _ in dload_real:
+    print("Real scores...")
+    real_scores = []
+    targets_real = []
+    preds_real = []
+    for x, target in dload_real:
         x = x.to(device)
         scores = score_fn(x)
         real_scores.append(scores.numpy())
-        print(scores.mean())
+
+        targets_real.append(to_np(target))
+        preds_real.append(to_np(torch.softmax(f.classify(x), 1)))
+
+    classification_calibration(np.squeeze(np.concatenate(targets_real)),
+                               np.concatenate(preds_real), tag="ID")
+
     fake_scores = []
     print("Fake scores...")
     if args.ood_dataset == "cifar_interp":
